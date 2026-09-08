@@ -1,4 +1,4 @@
-# tagalog_study_bible
+# Tagalog Study Bible
 
 A new Flutter project.
 
