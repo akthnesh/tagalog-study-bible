@@ -5,6 +5,7 @@ import 'models/bible_book.dart';
 import 'models/bible_chapter.dart';
 import 'models/bible_verse.dart';
 import 'services/bible_xml_service.dart';
+import 'services/study_bible_service.dart';
 
 const _bg = Color(0xFF202020);
 const _panel = Color(0xFF171717);
@@ -43,19 +44,80 @@ class BibleShell extends StatefulWidget {
 
 class BibleShellState extends State<BibleShell> {
   final BibleXmlService _bibleService = BibleXmlService();
+  final StudyBibleService _studyService = StudyBibleService();
   late Future<List<BibleBook>> _bibleFuture;
+  late Future<StudyBibleData> _studyFuture;
 
   int selectedBookIndex = 0;
   int selectedChapterIndex = 0;
-  int selectedVerse = -1;
+  int? selectedVerse;
+  String selectedTranslation = 'ABTAG';
 
   bool books = true;
   bool study = true;
+
+  // Translation cache. ABTAG is supplied by _bibleFuture.
+  final Map<String, List<BibleBook>> _translationCache = {};
+  final Map<String, Future<List<BibleBook>>> _translationLoads = {};
 
   @override
   void initState() {
     super.initState();
     _bibleFuture = _bibleService.loadBible();
+    _studyFuture = _studyService.load();
+
+    // Preload the complete English translations in the background.
+    for (final id in const ['ESV', 'NKJV', 'NASB', 'LSB', 'NIV']) {
+      _loadTranslation(id);
+    }
+  }
+
+  Future<List<BibleBook>> _loadTranslation(String id) {
+    final cached = _translationCache[id];
+    if (cached != null) return Future.value(cached);
+
+    final existing = _translationLoads[id];
+    if (existing != null) return existing;
+
+    // Chain the future directly so awaiters wait for the cache
+    final future = _bibleService.loadTranslation(id).then((data) {
+      if (!mounted) return data;
+      _translationLoads.remove(id);
+
+      if (data.isNotEmpty) {
+        _translationCache[id] = data;
+      }
+
+      if (selectedTranslation == id) {
+        setState(() {});
+      }
+      return data;
+    }).catchError((_) {
+      _translationLoads.remove(id);
+      if (mounted && selectedTranslation == id) {
+        setState(() {});
+      }
+      return <BibleBook>[];
+    });
+
+    _translationLoads[id] = future;
+    return future;
+  }
+
+  Future<void> _changeTranslation(String id) async {
+    if (id == selectedTranslation) return;
+
+    setState(() {
+      selectedTranslation = id;
+      selectedVerse = null;
+    });
+
+    if (id == 'ABTAG') return;
+
+    await _loadTranslation(id);
+
+    if (!mounted || selectedTranslation != id) return;
+    setState(() {});
   }
 
   BibleBook? _bookAt(List<BibleBook> bible, int index) =>
@@ -64,15 +126,52 @@ class BibleShellState extends State<BibleShell> {
   BibleChapter? _chapterAt(BibleBook book, int index) =>
       index >= 0 && index < book.chapters.length ? book.chapters[index] : null;
 
+  /// Gets the same book/chapter from the selected translation.
+  /// While an English XML is still loading, ABTAG remains visible rather than
+  /// showing stale/empty data.
+  BibleBook _getTranslatedBook(BibleBook abtagBook) {
+    if (selectedTranslation == 'ABTAG') return abtagBook;
+
+    final translationBooks = _translationCache[selectedTranslation];
+    if (translationBooks == null || translationBooks.isEmpty) {
+      return abtagBook;
+    }
+
+    if (selectedBookIndex >= 0 && selectedBookIndex < translationBooks.length) {
+      return translationBooks[selectedBookIndex];
+    }
+
+    return abtagBook;
+  }
+
+  BibleChapter _getTranslatedChapter(
+      BibleBook translatedBook, BibleChapter abtagChapter) {
+    if (selectedTranslation == 'ABTAG') return abtagChapter;
+
+    if (selectedChapterIndex >= 0 &&
+        selectedChapterIndex < translatedBook.chapters.length) {
+      final matchChapter = translatedBook.chapters[selectedChapterIndex];
+      if (matchChapter.verses.isNotEmpty) {
+        return matchChapter;
+      }
+    }
+
+    return abtagChapter;
+  }
+
+  String get _translationLabel =>
+      BibleXmlService.translationNames[selectedTranslation] ??
+      selectedTranslation;
+
   void _selectBook(int index) => setState(() {
         selectedBookIndex = index;
         selectedChapterIndex = 0;
-        selectedVerse = 1;
+        selectedVerse = null;
       });
 
   void _selectChapter(int index) => setState(() {
         selectedChapterIndex = index;
-        selectedVerse = 1;
+        selectedVerse = null;
       });
 
   void _goChapter(List<BibleBook> bible, int direction) {
@@ -98,12 +197,13 @@ class BibleShellState extends State<BibleShell> {
     }
 
     if (bookIndex < 0 || bookIndex >= bible.length) return;
-    if (chapterIndex < 0 || chapterIndex >= bible[bookIndex].chapters.length) return;
+    if (chapterIndex < 0 || chapterIndex >= bible[bookIndex].chapters.length)
+      return;
 
     setState(() {
       selectedBookIndex = bookIndex;
       selectedChapterIndex = chapterIndex;
-      selectedVerse = 1;
+      selectedVerse = null;
     });
   }
 
@@ -149,6 +249,7 @@ class BibleShellState extends State<BibleShell> {
                   error: snapshot.error,
                   onRetry: () => setState(() {
                     _bibleFuture = _bibleService.loadBible();
+                    _studyFuture = _studyService.load();
                   }),
                 );
               }
@@ -156,7 +257,8 @@ class BibleShellState extends State<BibleShell> {
               final bible = snapshot.data ?? const <BibleBook>[];
               final book = _bookAt(bible, selectedBookIndex);
               if (book == null) {
-                return const _ErrorScreen(message: 'Walang laman ang Bible data.');
+                return const _ErrorScreen(
+                    message: 'Walang laman ang Bible data.');
               }
               final chapter = _chapterAt(book, selectedChapterIndex);
               if (chapter == null) {
@@ -164,14 +266,12 @@ class BibleShellState extends State<BibleShell> {
                   message: 'Walang chapter data para sa napiling aklat.',
                 );
               }
-
-              if (selectedVerse > 0 && !chapter.verses.any((v) => v.number == selectedVerse)) {
-                selectedVerse = chapter.verses.isEmpty ? -1 : chapter.verses.first.number;
-              }
-
               final width = MediaQuery.sizeOf(context).width;
               final mobile = width < 900;
               final narrowDesktop = width < 1250;
+              final translatedBook = _getTranslatedBook(book);
+              final translatedChapter =
+                  _getTranslatedChapter(translatedBook, chapter);
 
               return Column(
                 children: [
@@ -191,12 +291,15 @@ class BibleShellState extends State<BibleShell> {
                         Expanded(
                           child: _Reader(
                             book: book,
-                            chapter: chapter,
+                            chapter: _getTranslatedChapter(book, chapter),
                             selectedVerse: selectedVerse,
+                            translationLabel: _translationLabel,
+                            selectedTranslation: selectedTranslation,
+                            onTranslationChanged: _changeTranslation,
                             onSelected: (verse) =>
                                 setState(() => selectedVerse = verse),
-                            onDeselect: () =>
-                                setState(() => selectedVerse = -1),
+                            onClearSelection: () =>
+                                setState(() => selectedVerse = null),
                             onPreviousChapter: () => _goChapter(bible, -1),
                             onNextChapter: () => _goChapter(bible, 1),
                             onChapterPicker: () =>
@@ -211,10 +314,28 @@ class BibleShellState extends State<BibleShell> {
                         if (study && !mobile)
                           SizedBox(
                             width: narrowDesktop ? 320 : 315,
-                            child: _StudyPanel(
-                              book: book,
-                              chapter: chapter,
-                              verse: selectedVerse,
+                            child: FutureBuilder<StudyBibleData>(
+                              future: _studyFuture,
+                              builder: (context, studySnapshot) {
+                                if (studySnapshot.connectionState ==
+                                    ConnectionState.waiting) {
+                                  return const _StudyLoadingPanel();
+                                }
+                                if (studySnapshot.hasError) {
+                                  return _StudyErrorPanel(
+                                      error: studySnapshot.error);
+                                }
+                                final data = studySnapshot.data;
+                                if (data == null) {
+                                  return const _StudyErrorPanel();
+                                }
+                                return _StudyPanel(
+                                  book: book,
+                                  chapter: chapter,
+                                  verse: selectedVerse,
+                                  data: data,
+                                );
+                              },
                             ),
                           ),
                       ],
@@ -256,7 +377,8 @@ class _ErrorScreen extends StatelessWidget {
             children: [
               const Icon(Icons.error_outline, color: _gold, size: 42),
               const SizedBox(height: 14),
-              Text(message ?? 'Hindi ma-load ang Bible XML.', textAlign: TextAlign.center),
+              Text(message ?? 'Hindi ma-load ang Bible XML.',
+                  textAlign: TextAlign.center),
               if (error != null) ...[
                 const SizedBox(height: 10),
                 SelectableText('$error', textAlign: TextAlign.center),
@@ -340,7 +462,11 @@ class _BookPanel extends StatelessWidget {
                   child: ListView(
                     padding: const EdgeInsets.fromLTRB(38, 8, 8, 25),
                     children: [
-                      const Text('OLD TESTAMENT', style: TextStyle(color: _gold, fontSize: 12, fontWeight: FontWeight.bold)),
+                      const Text('OLD TESTAMENT',
+                          style: TextStyle(
+                              color: _gold,
+                              fontSize: 12,
+                              fontWeight: FontWeight.bold)),
                       const SizedBox(height: 18),
                       _BookGroups(
                         groups: _otGroups,
@@ -356,7 +482,11 @@ class _BookPanel extends StatelessWidget {
                   child: ListView(
                     padding: const EdgeInsets.fromLTRB(6, 8, 25, 25),
                     children: [
-                      const Text('NEW TESTAMENT', style: TextStyle(color: _gold, fontSize: 12, fontWeight: FontWeight.bold)),
+                      const Text('NEW TESTAMENT',
+                          style: TextStyle(
+                              color: _gold,
+                              fontSize: 12,
+                              fontWeight: FontWeight.bold)),
                       const SizedBox(height: 18),
                       _BookGroups(
                         groups: _ntGroups,
@@ -394,52 +524,50 @@ class _BookGroups extends StatelessWidget {
   });
 
   @override
-  Widget build(BuildContext context) => Padding(
-        padding: EdgeInsets.zero,
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: groups.entries.map((entry) {
-            final items = entry.value
-                .map((n) => byNumber[n])
-                .whereType<BibleBook>()
-                .toList();
-            return Padding(
-              padding: const EdgeInsets.only(bottom: 18),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(
-                    entry.key,
-                    style: const TextStyle(
-                      color: _gold,
-                      fontSize: 13,
-                      fontWeight: FontWeight.bold,
-                    ),
+  Widget build(BuildContext context) => Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: groups.entries.map((entry) {
+          final items = entry.value
+              .map((n) => byNumber[n])
+              .whereType<BibleBook>()
+              .toList();
+          return Padding(
+            padding: const EdgeInsets.only(bottom: 11),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  entry.key,
+                  style: const TextStyle(
+                    color: _gold,
+                    fontSize: 13,
+                    fontWeight: FontWeight.bold,
                   ),
-                  const SizedBox(height: 6),
-                  ...items.map((book) {
-                    final index = books.indexOf(book);
-                    final active = index == selectedIndex;
-                    return InkWell(
-                      onTap: () => onSelected(index),
-                      child: Padding(
-                        padding: const EdgeInsets.symmetric(vertical: 5),
-                        child: Text(
-                          book.name,
-                          style: TextStyle(
-                            color: active ? _gold : _text,
-                            fontSize: 13.5,
-                            fontWeight: active ? FontWeight.bold : FontWeight.normal,
-                          ),
+                ),
+                const SizedBox(height: 2),
+                ...items.map((book) {
+                  final index = books.indexOf(book);
+                  final active = index == selectedIndex;
+                  return InkWell(
+                    onTap: () => onSelected(index),
+                    child: Padding(
+                      padding: const EdgeInsets.symmetric(vertical: 2),
+                      child: Text(
+                        book.name,
+                        style: TextStyle(
+                          color: active ? _gold : _text,
+                          fontSize: 13.5,
+                          fontWeight:
+                              active ? FontWeight.bold : FontWeight.normal,
                         ),
                       ),
-                    );
-                  }),
-                ],
-              ),
-            );
-          }).toList(),
-        ),
+                    ),
+                  );
+                }),
+              ],
+            ),
+          );
+        }).toList(),
       );
 }
 
@@ -451,19 +579,37 @@ class _BottomLinks extends StatelessWidget {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: const [
-            Text('BOOK INTRODUCTIONS', style: TextStyle(color: _text, fontSize: 16, fontWeight: FontWeight.bold)),
+            Text('BOOK INTRODUCTIONS',
+                style: TextStyle(
+                    color: _text, fontSize: 16, fontWeight: FontWeight.bold)),
             SizedBox(height: 10),
-            Text('THEOLOGY', style: TextStyle(color: _text, fontSize: 16, fontWeight: FontWeight.bold)),
+            Text('THEOLOGY',
+                style: TextStyle(
+                    color: _text, fontSize: 16, fontWeight: FontWeight.bold)),
             SizedBox(height: 10),
-            Text('DOCTRINES', style: TextStyle(color: _text, fontSize: 16, fontWeight: FontWeight.bold)),
+            Text('DOCTRINES',
+                style: TextStyle(
+                    color: _text, fontSize: 16, fontWeight: FontWeight.bold)),
             SizedBox(height: 22),
             Row(
               children: [
-                Text('Login', style: TextStyle(color: _text, fontSize: 22, fontWeight: FontWeight.bold)),
+                Text('Login',
+                    style: TextStyle(
+                        color: _text,
+                        fontSize: 22,
+                        fontWeight: FontWeight.bold)),
                 SizedBox(width: 28),
-                Text('A+', style: TextStyle(color: _text, fontSize: 16, fontWeight: FontWeight.bold)),
+                Text('A+',
+                    style: TextStyle(
+                        color: _text,
+                        fontSize: 16,
+                        fontWeight: FontWeight.bold)),
                 SizedBox(width: 12),
-                Text('A-', style: TextStyle(color: _muted, fontSize: 16, fontWeight: FontWeight.bold)),
+                Text('A-',
+                    style: TextStyle(
+                        color: _muted,
+                        fontSize: 16,
+                        fontWeight: FontWeight.bold)),
               ],
             ),
           ],
@@ -474,28 +620,34 @@ class _BottomLinks extends StatelessWidget {
 class _Reader extends StatefulWidget {
   final BibleBook book;
   final BibleChapter chapter;
-  final int selectedVerse;
+  final int? selectedVerse;
   final ValueChanged<int> onSelected;
-  final VoidCallback onDeselect;
+  final VoidCallback onClearSelection;
   final VoidCallback onPreviousChapter;
   final VoidCallback onNextChapter;
   final VoidCallback onChapterPicker;
   final VoidCallback onBooks;
   final VoidCallback onStudy;
   final bool showBooksButton;
+  final String translationLabel;
+  final String selectedTranslation;
+  final ValueChanged<String> onTranslationChanged;
 
   const _Reader({
     required this.book,
     required this.chapter,
     required this.selectedVerse,
     required this.onSelected,
-    required this.onDeselect,
+    required this.onClearSelection,
     required this.onPreviousChapter,
     required this.onNextChapter,
     required this.onChapterPicker,
     required this.onBooks,
     required this.onStudy,
     required this.showBooksButton,
+    required this.translationLabel,
+    required this.selectedTranslation,
+    required this.onTranslationChanged,
   });
 
   @override
@@ -503,7 +655,7 @@ class _Reader extends StatefulWidget {
 }
 
 class _ReaderState extends State<_Reader> {
-  final _scrollController = ScrollController();
+  final ScrollController _scrollController = ScrollController();
 
   @override
   void dispose() {
@@ -520,6 +672,8 @@ class _ReaderState extends State<_Reader> {
               onBooks: widget.onBooks,
               onStudy: widget.onStudy,
               showBooksButton: widget.showBooksButton,
+              selectedTranslation: widget.selectedTranslation,
+              onTranslationChanged: widget.onTranslationChanged,
             ),
             Container(
               height: 55,
@@ -529,22 +683,28 @@ class _ReaderState extends State<_Reader> {
               ),
               child: Row(
                 children: [
-                  IconButton(onPressed: widget.onPreviousChapter, icon: const Icon(Icons.chevron_left, size: 30)),
+                  IconButton(
+                      onPressed: widget.onPreviousChapter,
+                      icon: const Icon(Icons.chevron_left, size: 30)),
                   Expanded(
                     child: Center(
                       child: InkWell(
                         onTap: widget.onChapterPicker,
                         child: Padding(
-                          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                          padding: const EdgeInsets.symmetric(
+                              horizontal: 12, vertical: 8),
                           child: Text(
                             '${widget.book.name} ${widget.chapter.number}',
-                            style: const TextStyle(fontSize: 19, fontWeight: FontWeight.bold),
+                            style: const TextStyle(
+                                fontSize: 19, fontWeight: FontWeight.bold),
                           ),
                         ),
                       ),
                     ),
                   ),
-                  IconButton(onPressed: widget.onNextChapter, icon: const Icon(Icons.chevron_right, size: 30)),
+                  IconButton(
+                      onPressed: widget.onNextChapter,
+                      icon: const Icon(Icons.chevron_right, size: 30)),
                 ],
               ),
             ),
@@ -553,40 +713,40 @@ class _ReaderState extends State<_Reader> {
                 controller: _scrollController,
                 thumbVisibility: true,
                 interactive: true,
-                child: ListView(
-                  controller: _scrollController,
-                  padding: const EdgeInsets.fromLTRB(60, 32, 60, 0),
-                  children: [
-                    GestureDetector(
-                      behavior: HitTestBehavior.opaque,
-                      onTap: widget.onDeselect,
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Text(
-                            '${widget.book.name} ${widget.chapter.number}',
-                            style: const TextStyle(fontSize: 29, fontWeight: FontWeight.bold),
-                          ),
-                          const SizedBox(height: 4),
-                          const Text('Ang Biblia, 2001', style: TextStyle(color: _muted, fontSize: 13)),
-                          if (widget.chapter.title != null) ...[
-                            const SizedBox(height: 20),
-                            Text(
-                              widget.chapter.title!,
-                              style: const TextStyle(fontSize: 17, fontWeight: FontWeight.bold),
-                            ),
-                          ],
-                          const SizedBox(height: 22),
-                          _BibleParagraphs(
-                            verses: widget.chapter.verses,
-                            selectedVerse: widget.selectedVerse,
-                            onSelected: widget.onSelected,
-                          ),
-                          const SizedBox(height: 200),
-                        ],
+                trackVisibility: true,
+                thickness: 10,
+                radius: const Radius.circular(8),
+                child: GestureDetector(
+                  behavior: HitTestBehavior.translucent,
+                  onTap: widget.onClearSelection,
+                  child: ListView(
+                    controller: _scrollController,
+                    padding: const EdgeInsets.fromLTRB(60, 32, 60, 70),
+                    children: [
+                      Text(
+                        '${widget.book.name} ${widget.chapter.number}',
+                        style: const TextStyle(
+                            fontSize: 29, fontWeight: FontWeight.bold),
                       ),
-                    ),
-                  ],
+                      const SizedBox(height: 4),
+                      Text(widget.translationLabel,
+                          style: const TextStyle(color: _muted, fontSize: 13)),
+                      if (widget.chapter.title != null) ...[
+                        const SizedBox(height: 20),
+                        Text(
+                          widget.chapter.title!,
+                          style: const TextStyle(
+                              fontSize: 17, fontWeight: FontWeight.bold),
+                        ),
+                      ],
+                      const SizedBox(height: 22),
+                      _BibleParagraphs(
+                        verses: widget.chapter.verses,
+                        selectedVerse: widget.selectedVerse,
+                        onSelected: widget.onSelected,
+                      ),
+                    ],
+                  ),
                 ),
               ),
             ),
@@ -598,10 +758,14 @@ class _ReaderState extends State<_Reader> {
 class _ReaderToolbar extends StatelessWidget {
   final VoidCallback onBooks, onStudy;
   final bool showBooksButton;
+  final String selectedTranslation;
+  final ValueChanged<String> onTranslationChanged;
   const _ReaderToolbar({
     required this.onBooks,
     required this.onStudy,
     required this.showBooksButton,
+    required this.selectedTranslation,
+    required this.onTranslationChanged,
   });
 
   @override
@@ -615,38 +779,66 @@ class _ReaderToolbar extends StatelessWidget {
                 icon: const Icon(Icons.menu_book_outlined),
                 tooltip: 'Table of contents',
               ),
-            Expanded(
-              child: Row(
-                children: [
-                  SizedBox(
-                    width: 235,
-                    height: 42,
-                    child: TextField(
-                      decoration: InputDecoration(
-                        hintText: 'Search',
-                        prefixIcon: const Icon(Icons.search),
-                        contentPadding: EdgeInsets.zero,
-                        enabledBorder: OutlineInputBorder(
-                          borderSide: const BorderSide(color: _muted),
-                          borderRadius: BorderRadius.circular(5),
-                        ),
-                        focusedBorder: OutlineInputBorder(
-                          borderSide: const BorderSide(color: _gold),
-                          borderRadius: BorderRadius.circular(5),
-                        ),
-                      ),
-                    ),
+            const Spacer(),
+            SizedBox(
+              width: 235,
+              height: 42,
+              child: TextField(
+                decoration: InputDecoration(
+                  hintText: 'Search',
+                  prefixIcon: const Icon(Icons.search),
+                  contentPadding: EdgeInsets.zero,
+                  enabledBorder: OutlineInputBorder(
+                    borderSide: const BorderSide(color: _muted),
+                    borderRadius: BorderRadius.circular(5),
                   ),
-                  const SizedBox(width: 10),
-                  const _TranslationButton('ABTAG', active: true),
-                  const SizedBox(width: 8),
-                  const _TranslationButton('ESV'),
-                  const SizedBox(width: 8),
-                  const _TranslationButton('NKJV'),
-                ],
+                  focusedBorder: OutlineInputBorder(
+                    borderSide: const BorderSide(color: _gold),
+                    borderRadius: BorderRadius.circular(5),
+                  ),
+                ),
               ),
             ),
-            IconButton(onPressed: onStudy, icon: const Icon(Icons.view_sidebar_outlined), tooltip: 'Study panel'),
+            const SizedBox(width: 10),
+            _TranslationButton(
+              'ABTAG',
+              active: selectedTranslation == 'ABTAG',
+              onTap: () => onTranslationChanged('ABTAG'),
+            ),
+            const SizedBox(width: 8),
+            _TranslationButton(
+              'ESV',
+              active: selectedTranslation == 'ESV',
+              onTap: () => onTranslationChanged('ESV'),
+            ),
+            const SizedBox(width: 8),
+            _TranslationButton(
+              'NKJV',
+              active: selectedTranslation == 'NKJV',
+              onTap: () => onTranslationChanged('NKJV'),
+            ),
+            _TranslationButton(
+              'NASB',
+              active: selectedTranslation == 'NASB',
+              onTap: () => onTranslationChanged('NASB'),
+            ),
+            const SizedBox(width: 8),
+            _TranslationButton(
+              'LSB',
+              active: selectedTranslation == 'LSB',
+              onTap: () => onTranslationChanged('LSB'),
+            ),
+            const SizedBox(width: 8),
+            _TranslationButton(
+              'NIV',
+              active: selectedTranslation == 'NIV',
+              onTap: () => onTranslationChanged('NIV'),
+            ),
+            const Spacer(),
+            IconButton(
+                onPressed: onStudy,
+                icon: const Icon(Icons.view_sidebar_outlined),
+                tooltip: 'Study panel'),
           ],
         ),
       );
@@ -655,23 +847,40 @@ class _ReaderToolbar extends StatelessWidget {
 class _TranslationButton extends StatelessWidget {
   final String label;
   final bool active;
-  const _TranslationButton(this.label, {this.active = false});
+  final VoidCallback onTap;
+
+  const _TranslationButton(
+    this.label, {
+    this.active = false,
+    required this.onTap,
+  });
+
   @override
-  Widget build(BuildContext context) => Container(
-        height: 40,
-        padding: const EdgeInsets.symmetric(horizontal: 16),
-        alignment: Alignment.center,
-        decoration: BoxDecoration(
-          color: active ? const Color(0xFF121212) : const Color(0xFF181818),
-          borderRadius: BorderRadius.circular(4),
+  Widget build(BuildContext context) => InkWell(
+        onTap: onTap,
+        borderRadius: BorderRadius.circular(4),
+        child: Container(
+          height: 40,
+          padding: const EdgeInsets.symmetric(horizontal: 16),
+          alignment: Alignment.center,
+          decoration: BoxDecoration(
+            color: active ? const Color(0xFF121212) : const Color(0xFF181818),
+            borderRadius: BorderRadius.circular(4),
+          ),
+          child: Text(
+            label,
+            style: const TextStyle(
+              fontSize: 17,
+              fontWeight: FontWeight.bold,
+            ),
+          ),
         ),
-        child: Text(label, style: const TextStyle(fontSize: 17, fontWeight: FontWeight.bold)),
       );
 }
 
 class _BibleParagraphs extends StatelessWidget {
   final List<BibleVerse> verses;
-  final int selectedVerse;
+  final int? selectedVerse;
   final ValueChanged<int> onSelected;
 
   const _BibleParagraphs({
@@ -712,7 +921,7 @@ class _BibleParagraphs extends StatelessWidget {
 
 class _BibleParagraphText extends StatefulWidget {
   final List<BibleVerse> verses;
-  final int selectedVerse;
+  final int? selectedVerse;
   final ValueChanged<int> onSelected;
   const _BibleParagraphText({
     required this.verses,
@@ -735,7 +944,8 @@ class _BibleParagraphTextState extends State<_BibleParagraphText> {
 
   void _makeRecognizers() {
     _recognizers = widget.verses
-        .map((verse) => TapGestureRecognizer()..onTap = () => widget.onSelected(verse.number))
+        .map((verse) => TapGestureRecognizer()
+          ..onTap = () => widget.onSelected(verse.number))
         .toList();
   }
 
@@ -767,7 +977,7 @@ class _BibleParagraphTextState extends State<_BibleParagraphText> {
           text: '${verse.number} ',
           recognizer: _recognizers[i],
           style: TextStyle(
-            color: selected ? Colors.black : _gold,
+            color: selected ? const Color(0xFF202020) : _gold,
             fontSize: 11,
             fontWeight: FontWeight.bold,
             backgroundColor: selected ? const Color(0xFFE6C229) : null,
@@ -779,7 +989,7 @@ class _BibleParagraphTextState extends State<_BibleParagraphText> {
           text: '${verse.text} ',
           recognizer: _recognizers[i],
           style: TextStyle(
-            color: selected ? Colors.black : _text,
+            color: selected ? const Color(0xFF202020) : _text,
             fontSize: 16,
             height: 1.48,
             backgroundColor: selected ? const Color(0xFFE6C229) : null,
@@ -796,122 +1006,471 @@ class _BibleParagraphTextState extends State<_BibleParagraphText> {
   }
 }
 
-class _StudyPanel extends StatelessWidget {
+class _StudyLoadingPanel extends StatelessWidget {
+  const _StudyLoadingPanel();
+  @override
+  Widget build(BuildContext context) => Container(
+        color: _panel,
+        child: const Center(child: CircularProgressIndicator(color: _gold)),
+      );
+}
+
+class _StudyErrorPanel extends StatelessWidget {
+  final Object? error;
+  const _StudyErrorPanel({this.error});
+  @override
+  Widget build(BuildContext context) => Container(
+        color: _panel,
+        padding: const EdgeInsets.all(18),
+        child: Text(
+          error == null
+              ? 'Study data is unavailable.'
+              : 'Study data error:\n$error',
+          style: const TextStyle(color: _muted, fontSize: 12, height: 1.4),
+        ),
+      );
+}
+
+class _StudyPanel extends StatefulWidget {
   final BibleBook book;
   final BibleChapter chapter;
-  final int verse;
+  final int? verse;
+  final StudyBibleData data;
 
   const _StudyPanel({
     required this.book,
     required this.chapter,
     required this.verse,
+    required this.data,
   });
 
   @override
+  State<_StudyPanel> createState() => _StudyPanelState();
+}
+
+class _StudyPanelState extends State<_StudyPanel> {
+  final ScrollController _notesScrollController = ScrollController();
+
+  @override
+  void dispose() {
+    _notesScrollController.dispose();
+    super.dispose();
+  }
+
+  @override
   Widget build(BuildContext context) {
-    final hasSelection = verse > 0;
-    final selected = hasSelection
-        ? chapter.verses.where((v) => v.number == verse).firstOrNull
-        : null;
+    final selected = widget.verse == null
+        ? null
+        : widget.chapter.verses
+            .where((v) => v.number == widget.verse)
+            .firstOrNull;
+    final notes = widget.verse == null
+        ? const <StudyNote>[]
+        : widget.data
+            .notesFor(widget.book.number, widget.chapter.number, widget.verse!);
+    final refs = widget.verse == null
+        ? const <CrossReference>[]
+        : widget.data.referencesFor(
+            widget.book.number, widget.chapter.number, widget.verse!);
+    final exegetical = widget.verse == null
+        ? null
+        : widget.data.exegeticalFor(
+            widget.book.number, widget.chapter.number, widget.verse!);
+
     return Container(
       decoration: const BoxDecoration(
         color: _panel,
         border: Border(left: BorderSide(color: _line)),
       ),
       child: Scrollbar(
+        controller: _notesScrollController,
         thumbVisibility: true,
-        child: ListView(
-          padding: const EdgeInsets.fromLTRB(15, 8, 15, 45),
-          children: [
-            const Text(
-              'Notes and Cross References',
-              style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
-            ),
-            const SizedBox(height: 3),
-            Text(
-              hasSelection
-                  ? '${book.name} ${chapter.number}:$verse'
-                  : '${book.name} ${chapter.number}',
-              style: const TextStyle(color: _muted, fontSize: 11),
-            ),
-            const SizedBox(height: 15),
-            if (!hasSelection) ...[
-              const SizedBox(height: 30),
-              const Center(
-                child: Icon(Icons.touch_app_outlined, size: 40, color: _muted),
+        interactive: true,
+        trackVisibility: true,
+        thickness: 10,
+        radius: const Radius.circular(8),
+        child: SingleChildScrollView(
+          controller: _notesScrollController,
+          primary: false,
+          padding: const EdgeInsets.fromLTRB(16, 18, 16, 45),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text(
+                'Notes and Cross References',
+                style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
               ),
-              const SizedBox(height: 12),
-              const Center(
-                child: Text(
-                  'Select a verse to view notes\nand cross references.',
-                  textAlign: TextAlign.center,
-                  style: TextStyle(color: _muted, fontSize: 14, height: 1.5),
-                ),
-              ),
-            ],
-            if (hasSelection && selected != null)
+              const SizedBox(height: 4),
               Text(
-                selected.text,
-                style: const TextStyle(
-                  color: _text,
-                  fontSize: 13,
-                  height: 1.45,
-                  fontWeight: FontWeight.bold,
-                ),
+                widget.verse == null
+                    ? 'No verse selected'
+                    : 'Selected ${widget.book.name} ${widget.chapter.number}:${widget.verse}',
+                style: const TextStyle(color: _muted, fontSize: 11),
               ),
-            if (hasSelection) ...[
-              const SizedBox(height: 20),
-              const _StudySection(
-                title: 'Cross References',
-                child: Text(
-                  'Cross references connected to this passage will appear here.',
-                  style: TextStyle(color: _text, fontSize: 13, height: 1.45),
+              const SizedBox(height: 16),
+              if (selected == null) ...[
+                const Padding(
+                  padding: EdgeInsets.symmetric(vertical: 120, horizontal: 18),
+                  child: Center(
+                    child: Text(
+                      'Select a verse to view notes and cross references.',
+                      textAlign: TextAlign.center,
+                      style:
+                          TextStyle(color: _muted, fontSize: 13, height: 1.5),
+                    ),
+                  ),
                 ),
-              ),
-              const SizedBox(height: 22),
+              ] else ...[
+                const Text('SCRIPTURE',
+                    style: TextStyle(
+                        color: _gold,
+                        fontSize: 11,
+                        fontWeight: FontWeight.bold)),
+                const SizedBox(height: 7),
+                Text(
+                  selected.text,
+                  style:
+                      const TextStyle(color: _text, fontSize: 13, height: 1.5),
+                ),
+                const SizedBox(height: 20),
+              ],
               _StudySection(
-                title: 'Exegetical Notes on ${book.name} ${chapter.number}:$verse',
-                child: const Text(
-                  'Exegetical observations, contextual notes, and source-linked study material will appear here.',
-                  style: TextStyle(color: _text, fontSize: 13, height: 1.48),
-                ),
+                title: 'Cross References',
+                child: refs.isEmpty
+                    ? const Text(
+                        'No cross references are listed for this verse.',
+                        style: TextStyle(
+                            color: _muted, fontSize: 12, height: 1.45),
+                      )
+                    : Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: refs
+                            .map((ref) => Padding(
+                                  padding: const EdgeInsets.only(bottom: 10),
+                                  child: Text.rich(
+                                    TextSpan(
+                                      children: [
+                                        TextSpan(
+                                          text: '${ref.verse}  ',
+                                          style: const TextStyle(
+                                              color: _gold,
+                                              fontWeight: FontWeight.bold,
+                                              fontSize: 12),
+                                        ),
+                                        TextSpan(
+                                          text: ref.text,
+                                          style: const TextStyle(
+                                              color: _text,
+                                              fontSize: 12,
+                                              height: 1.45),
+                                        ),
+                                      ],
+                                    ),
+                                  ),
+                                ))
+                            .toList(),
+                      ),
               ),
-              const SizedBox(height: 22),
-              const _StudySection(
-                title: 'Hebrew Text',
-                child: Text(
-                  'Hebrew text will appear here when the original-language resource is connected.',
-                  style: TextStyle(color: _text, fontSize: 13, height: 1.45),
-                ),
+              const SizedBox(height: 18),
+              _StudySection(
+                title: 'Study Notes',
+                child: notes.isEmpty
+                    ? const Text(
+                        'No study note is attached to this verse in the loaded study corpus.',
+                        style: TextStyle(
+                            color: _muted, fontSize: 12, height: 1.45),
+                      )
+                    : Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: notes
+                            .map((note) => Padding(
+                                  padding: const EdgeInsets.only(bottom: 16),
+                                  child: Column(
+                                    crossAxisAlignment:
+                                        CrossAxisAlignment.start,
+                                    children: [
+                                      Text(
+                                        note.range,
+                                        style: const TextStyle(
+                                            color: _gold,
+                                            fontSize: 11,
+                                            fontWeight: FontWeight.bold),
+                                      ),
+                                      if (note.title.isNotEmpty) ...[
+                                        const SizedBox(height: 3),
+                                        Text(
+                                          note.title,
+                                          style: const TextStyle(
+                                              color: _text,
+                                              fontSize: 13,
+                                              fontWeight: FontWeight.bold,
+                                              height: 1.35),
+                                        ),
+                                      ],
+                                      const SizedBox(height: 6),
+                                      Text(
+                                        note.text,
+                                        style: const TextStyle(
+                                            color: _text,
+                                            fontSize: 12.5,
+                                            height: 1.5),
+                                      ),
+                                    ],
+                                  ),
+                                ))
+                            .toList(),
+                      ),
               ),
-              const SizedBox(height: 22),
-              const _StudySection(
-                title: 'Transliteration',
-                child: Text(
-                  'Original-language transliteration will appear here.',
-                  style: TextStyle(color: _text, fontSize: 13, height: 1.45),
+              if (exegetical != null) ...[
+                const SizedBox(height: 18),
+                _StudySection(
+                  title: 'Exegetical Notes',
+                  child: _ExegeticalDocumentView(markdown: exegetical.markdown),
                 ),
-              ),
-              const SizedBox(height: 22),
+              ],
+              const SizedBox(height: 18),
               const _StudySection(
-                title: 'Literal rendering',
+                title: 'Source',
                 child: Text(
-                  'A literal rendering and word-level observations will appear here.',
-                  style: TextStyle(color: _text, fontSize: 13, height: 1.45),
-                ),
-              ),
-              const SizedBox(height: 22),
-              const _StudySection(
-                title: 'Exegetical observation',
-                child: Text(
-                  'Detailed observations will be linked to the selected verse as the study corpus is integrated.',
-                  style: TextStyle(color: _text, fontSize: 13, height: 1.45),
+                  'ESV Study Bible — Study Notes and Cross References',
+                  style: TextStyle(color: _muted, fontSize: 11.5, height: 1.45),
                 ),
               ),
             ],
-          ],
+          ),
         ),
       ),
+    );
+  }
+}
+
+class _ExegeticalDocumentView extends StatelessWidget {
+  final String markdown;
+  const _ExegeticalDocumentView({required this.markdown});
+
+  @override
+  Widget build(BuildContext context) {
+    final blocks = _parseStudyMarkdown(markdown);
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: blocks
+          .map<Widget>((block) => _StudyMarkdownBlock(block: block))
+          .toList(),
+    );
+  }
+}
+
+class _StudyMarkdownData {
+  final String text;
+  final _StudyBlockKind kind;
+  const _StudyMarkdownData(this.text, this.kind);
+}
+
+enum _StudyBlockKind {
+  title,
+  heading,
+  subheading,
+  paragraph,
+  bullet,
+  quote,
+  divider
+}
+
+List<_StudyMarkdownData> _parseStudyMarkdown(String markdown) {
+  final lines = markdown.replaceAll('\r\n', '\n').split('\n');
+  final blocks = <_StudyMarkdownData>[];
+  final paragraph = <String>[];
+
+  void flushParagraph() {
+    if (paragraph.isEmpty) return;
+    final text = paragraph.join(' ').replaceAll(RegExp(r'\s+'), ' ').trim();
+    if (text.isNotEmpty)
+      blocks.add(_StudyMarkdownData(text, _StudyBlockKind.paragraph));
+    paragraph.clear();
+  }
+
+  for (var raw in lines) {
+    var line = raw.trim();
+    if (line.isEmpty) {
+      flushParagraph();
+      continue;
+    }
+    if (line == '---') {
+      flushParagraph();
+      blocks.add(const _StudyMarkdownData('', _StudyBlockKind.divider));
+      continue;
+    }
+    if (line.startsWith('**') && line.endsWith('**')) {
+      flushParagraph();
+      final clean = _stripMarkdown(line);
+      final kind = blocks.isEmpty
+          ? _StudyBlockKind.title
+          : RegExp(r'^\d+\.\s').hasMatch(clean)
+              ? _StudyBlockKind.subheading
+              : _StudyBlockKind.heading;
+      blocks.add(_StudyMarkdownData(clean, kind));
+      continue;
+    }
+    if (RegExp(r'^\*\*\d+\.').hasMatch(line)) {
+      flushParagraph();
+      blocks.add(
+          _StudyMarkdownData(_stripMarkdown(line), _StudyBlockKind.subheading));
+      continue;
+    }
+    if (line.startsWith('- ')) {
+      flushParagraph();
+      blocks.add(_StudyMarkdownData(
+          _stripMarkdown(line.substring(2)), _StudyBlockKind.bullet));
+      continue;
+    }
+    if (line.startsWith('>')) {
+      flushParagraph();
+      blocks.add(_StudyMarkdownData(
+          _stripMarkdown(line.substring(1).trim()), _StudyBlockKind.quote));
+      continue;
+    }
+    if (line.startsWith('|')) {
+      flushParagraph();
+      final cells = line
+          .split('|')
+          .map((e) => e.trim())
+          .where((e) => e.isNotEmpty)
+          .toList();
+      if (cells.isNotEmpty &&
+          !cells.every((e) => RegExp(r'^-+$').hasMatch(e))) {
+        blocks.add(
+            _StudyMarkdownData(cells.join('    '), _StudyBlockKind.paragraph));
+      }
+      continue;
+    }
+    paragraph.add(line);
+  }
+  flushParagraph();
+  return blocks;
+}
+
+String _stripMarkdown(String text) => text
+    .replaceAll(RegExp(r'\*\*'), '')
+    .replaceAll(RegExp(r'\*'), '')
+    .replaceAll(RegExp(r'`+'), '')
+    .replaceAll(RegExp(r'\s+'), ' ')
+    .trim();
+
+class _StudyMarkdownBlock extends StatelessWidget {
+  final _StudyMarkdownData block;
+  const _StudyMarkdownBlock({required this.block});
+
+  @override
+  Widget build(BuildContext context) {
+    switch (block.kind) {
+      case _StudyBlockKind.divider:
+        return const Padding(
+          padding: EdgeInsets.symmetric(vertical: 8),
+          child: Divider(color: _line),
+        );
+      case _StudyBlockKind.title:
+        return Padding(
+          padding: const EdgeInsets.only(bottom: 14),
+          child: Text(
+            block.text,
+            style: const TextStyle(
+                color: _text,
+                fontSize: 17,
+                fontWeight: FontWeight.bold,
+                height: 1.3),
+          ),
+        );
+      case _StudyBlockKind.heading:
+        return Padding(
+          padding: const EdgeInsets.only(top: 8, bottom: 6),
+          child: Text(
+            block.text,
+            style: const TextStyle(
+                color: _gold,
+                fontSize: 13.5,
+                fontWeight: FontWeight.bold,
+                height: 1.35),
+          ),
+        );
+      case _StudyBlockKind.subheading:
+        return Padding(
+          padding: const EdgeInsets.only(top: 10, bottom: 5),
+          child: Text(
+            block.text,
+            style: const TextStyle(
+                color: _text,
+                fontSize: 13,
+                fontWeight: FontWeight.bold,
+                height: 1.4),
+          ),
+        );
+      case _StudyBlockKind.bullet:
+        return Padding(
+          padding: const EdgeInsets.only(left: 7, bottom: 5),
+          child: Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text('• ', style: TextStyle(color: _gold, fontSize: 12.5)),
+              Expanded(
+                  child: Text(block.text,
+                      style: const TextStyle(
+                          color: _text, fontSize: 12.2, height: 1.5))),
+            ],
+          ),
+        );
+      case _StudyBlockKind.quote:
+        return Container(
+          margin: const EdgeInsets.symmetric(vertical: 5),
+          padding: const EdgeInsets.only(left: 10),
+          decoration: const BoxDecoration(
+              border: Border(left: BorderSide(color: _gold, width: 2))),
+          child: Text(block.text,
+              style: const TextStyle(
+                  color: _muted,
+                  fontSize: 12.2,
+                  height: 1.5,
+                  fontStyle: FontStyle.italic)),
+        );
+      case _StudyBlockKind.paragraph:
+        return Padding(
+          padding: const EdgeInsets.only(bottom: 9),
+          child: _RichStudyText(block.text),
+        );
+    }
+
+    return const SizedBox.shrink();
+  }
+}
+
+class _RichStudyText extends StatelessWidget {
+  final String text;
+  const _RichStudyText(this.text);
+
+  @override
+  Widget build(BuildContext context) {
+    final spans = <TextSpan>[];
+    final pattern = RegExp(r'(\*\*[^*]+\*\*|\*[^*]+\*|`[^`]+`)');
+    var last = 0;
+    for (final match in pattern.allMatches(text)) {
+      if (match.start > last) {
+        spans.add(TextSpan(text: text.substring(last, match.start)));
+      }
+      final value = match.group(0)!;
+      if (value.startsWith('`')) {
+        spans.add(TextSpan(
+            text: value.substring(1, value.length - 1),
+            style: const TextStyle(color: _gold, fontFamily: 'Georgia')));
+      } else {
+        spans.add(TextSpan(
+            text: value.replaceAll('*', ''),
+            style: const TextStyle(fontWeight: FontWeight.bold)));
+      }
+      last = match.end;
+    }
+    if (last < text.length) spans.add(TextSpan(text: text.substring(last)));
+    return Text.rich(
+      TextSpan(children: spans),
+      style: const TextStyle(color: _text, fontSize: 12.2, height: 1.55),
     );
   }
 }
@@ -924,7 +1483,9 @@ class _StudySection extends StatelessWidget {
   Widget build(BuildContext context) => Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Text(title, style: const TextStyle(fontSize: 14, fontWeight: FontWeight.bold)),
+          Text(title,
+              style:
+                  const TextStyle(fontSize: 14, fontWeight: FontWeight.bold)),
           const SizedBox(height: 8),
           child,
           const SizedBox(height: 10),
@@ -942,8 +1503,16 @@ class _MobileBar extends StatelessWidget {
         color: _panel,
         child: Row(
           children: [
-            Expanded(child: TextButton.icon(onPressed: onBooks, icon: const Icon(Icons.menu_book), label: const Text('Books'))),
-            Expanded(child: TextButton.icon(onPressed: onStudy, icon: const Icon(Icons.view_sidebar), label: const Text('Study'))),
+            Expanded(
+                child: TextButton.icon(
+                    onPressed: onBooks,
+                    icon: const Icon(Icons.menu_book),
+                    label: const Text('Books'))),
+            Expanded(
+                child: TextButton.icon(
+                    onPressed: onStudy,
+                    icon: const Icon(Icons.view_sidebar),
+                    label: const Text('Study'))),
           ],
         ),
       );
@@ -953,7 +1522,10 @@ class _ChapterPickerDialog extends StatelessWidget {
   final BibleBook book;
   final int selectedIndex;
   final ValueChanged<int> onSelected;
-  const _ChapterPickerDialog({required this.book, required this.selectedIndex, required this.onSelected});
+  const _ChapterPickerDialog(
+      {required this.book,
+      required this.selectedIndex,
+      required this.onSelected});
   @override
   Widget build(BuildContext context) => AlertDialog(
         backgroundColor: _panel,
@@ -979,7 +1551,8 @@ class _ChapterPickerDialog extends StatelessWidget {
                 ),
                 child: Text(
                   '${book.chapters[index].number}',
-                  style: TextStyle(color: index == selectedIndex ? Colors.black : _text),
+                  style: TextStyle(
+                      color: index == selectedIndex ? Colors.black : _text),
                 ),
               ),
             ),
@@ -992,7 +1565,10 @@ class _BookPickerDialog extends StatelessWidget {
   final List<BibleBook> books;
   final int selectedIndex;
   final ValueChanged<int> onSelected;
-  const _BookPickerDialog({required this.books, required this.selectedIndex, required this.onSelected});
+  const _BookPickerDialog(
+      {required this.books,
+      required this.selectedIndex,
+      required this.onSelected});
   @override
   Widget build(BuildContext context) => AlertDialog(
         backgroundColor: _panel,
