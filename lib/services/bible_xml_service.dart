@@ -6,27 +6,68 @@ import '../models/bible_chapter.dart';
 import '../models/bible_verse.dart';
 
 class BibleXmlService {
-  static const assetPath = 'assets/bible/ABTAG2001_Main_Translation.xml';
+  static const _translationPaths = {
+    'ABTAG': 'assets/bible/ABTAG2001_Main_Translation.xml',
+    'ESV': 'assets/bible/ESV.xml',
+    'NKJV': 'assets/bible/NKJV.xml',
+    'NIV': 'assets/bible/NIV.xml',
+    'LSB': 'assets/bible/LSB.xml',
+    'NASB': 'assets/bible/NASB.xml',
+  };
 
-  Future<List<BibleBook>> loadBible() async {
-    final xmlText = await rootBundle.loadString(assetPath);
-    final document = XmlDocument.parse(xmlText);
-    final root = document.rootElement;
+  static const translationNames = {
+    'ABTAG': 'Ang Biblia, 2001',
+    'ESV': 'English Standard Version',
+    'NKJV': 'New King James Version',
+    'NIV': 'New International Version',
+    'NASB': 'New American Standard Bible',
+    'LSB': 'Legacy Standard Bible',
+  };
 
-    return root
-        .findElements('book')
-        .map(_parseBook)
-        .toList(growable: false);
+  final Map<String, List<BibleBook>> _cache = {};
+
+  /// Load the default (ABTAG) translation.
+  Future<List<BibleBook>> loadBible() => loadTranslation('ABTAG');
+
+  /// Load a specific translation by ID.
+  Future<List<BibleBook>> loadTranslation(String translationId) async {
+    if (_cache.containsKey(translationId)) {
+      return _cache[translationId]!;
+    }
+
+    final path = _translationPaths[translationId];
+    if (path == null) {
+      return const <BibleBook>[];
+    }
+
+    try {
+      final xmlText = await rootBundle.loadString(path);
+      final document = XmlDocument.parse(xmlText);
+
+      // findAllElements bypasses extra wrappers like <testament>
+      final bookElements = document.findAllElements('book').toList();
+
+      final books = <BibleBook>[];
+      for (var b = 0; b < bookElements.length; b++) {
+        books.add(_parseBook(bookElements[b], b + 1));
+      }
+
+      _cache[translationId] = books;
+      return books;
+    } catch (e) {
+      return const <BibleBook>[];
+    }
   }
 
-  BibleBook _parseBook(XmlElement element) {
-    final chapters = element
-        .findElements('chapter')
-        .map(_parseChapter)
-        .toList(growable: false);
+  BibleBook _parseBook(XmlElement element, int bookIndex) {
+    final chapterElements = element.findAllElements('chapter').toList();
+    final chapters = <BibleChapter>[];
+    for (var c = 0; c < chapterElements.length; c++) {
+      chapters.add(_parseChapter(chapterElements[c], c + 1));
+    }
 
     return BibleBook(
-      number: _intAttr(element, 'number'),
+      number: _intAttr(element, 'number', fallback: bookIndex),
       osis: element.getAttribute('osis') ?? '',
       name: element.getAttribute('name') ?? '',
       chapterCount: _intAttr(element, 'chapters', fallback: chapters.length),
@@ -34,19 +75,20 @@ class BibleXmlService {
     );
   }
 
-  BibleChapter _parseChapter(XmlElement element) {
+  BibleChapter _parseChapter(XmlElement element, int chapterIndex) {
     final title = element.getElement('title')?.innerText.trim();
-    final verses = element
-        .findElements('verse')
-        .map((verse) => BibleVerse(
-              number: _intAttr(verse, 'number'),
-              osis: verse.getAttribute('osis') ?? '',
-              text: verse.innerText.trim(),
-            ))
-        .toList(growable: false);
+    final verseElements = element.findAllElements('verse').toList();
+    final verses = <BibleVerse>[];
+    for (var v = 0; v < verseElements.length; v++) {
+      verses.add(BibleVerse(
+        number: _intAttr(verseElements[v], 'number', fallback: v + 1),
+        osis: verseElements[v].getAttribute('osis') ?? '',
+        text: verseElements[v].innerText.trim(),
+      ));
+    }
 
     return BibleChapter(
-      number: _intAttr(element, 'number'),
+      number: _intAttr(element, 'number', fallback: chapterIndex),
       osis: element.getAttribute('osis') ?? '',
       name: element.getAttribute('name') ?? '',
       title: title?.isEmpty == true ? null : title,
